@@ -1,0 +1,20 @@
+[project]
+name = "financial-rag"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi[standart]>=0.141.1",
+    "langchain>=1.4.0",
+    "langchain-google-genai>=4.4.0",
+    "python-dotenv>=1.2.3",
+]
+
+[project.scripts]
+financial-rag = "financial_rag.main:main"
+
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
