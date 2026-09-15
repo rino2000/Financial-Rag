@@ -1,14 +1,18 @@
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from pprint import pprint
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain.messages import HumanMessage
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.tools import tool
 from langchain_community.vectorstores import InMemoryVectorStore
 from langchain_core.documents import Document
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pydantic import BaseModel, Field
 
 load_dotenv()
 
@@ -16,21 +20,50 @@ embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-
 vector_store = InMemoryVectorStore(embeddings)
 
 
-def split_pdf_content(path: str) -> list[Document]:
-    loader = PyPDFLoader(path)
-    all_documents = loader.load()
+class FinancialMetrics(BaseModel):
+    company: str = Field(description="Company name, e.g., Visa")
+    metric_name: str = Field(
+        description="Name of the financial metric (e.g., Net Revenue)"
+    )
+    period: str = Field(description="Fiscal period or quarter (e.g., Q2)")
+    value: float = Field(description="Exact numerical value without symbols or text")
+    unit: str = Field(description="Unit of measurement (e.g., billions USD)")
 
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000, chunk_overlap=200
-    ).split_documents(all_documents)
-    return text_splitter
+
+def _process_single_pdf(file_path: Path) -> list[Document]:
+    try:
+        loader = PyPDFLoader(str(file_path))
+        documents = loader.load()
+        return RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+        ).split_documents(documents)
+    except Exception as e:
+        print(f"Failed to process {file_path.name}: {e}")
+        return []
+
+
+def split_pdf_content(files: list[Path], max_workers: int = 3) -> list[Document]:
+    all_documents: list[Document] = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_file = {
+            executor.submit(_process_single_pdf, file_path): file_path
+            for file_path in files
+        }
+
+        for future in as_completed(future_to_file):
+            docs = future.result()
+            all_documents.extend(docs)
+
+    return all_documents
 
 
 def load_embeddings(documents: list[Document]):
     vector_store.add_documents(documents=documents)
 
 
-@tool(return_direct=True)
+@tool
 def search_pdf(query: str) -> str:
     """Search in visa financial report in query
 
@@ -41,46 +74,40 @@ def search_pdf(query: str) -> str:
         str: information about the data in the document
     """
 
-    retriev = vector_store.similarity_search(query=query, k=4)
-    return "".join([document.page_content for document in retriev])
+    retriev = vector_store.similarity_search(query=query)
+    return "\n\n".join([document.page_content for document in retriev])
 
 
 def main():
-    path = str(Path(__file__).resolve().parents[2] / "documents" / "visa.pdf")
+    dir: Path = (Path.cwd() / "documents").resolve()
+    max_workers: int = os.cpu_count() or 1
 
-    documents = split_pdf_content(path)
+    pdf_files: list[Path] = [file for file in dir.glob("*.pdf") if file.is_file()]
+
+    documents: list[Document] = split_pdf_content(pdf_files, max_workers=max_workers)
     load_embeddings(documents)
 
-    system_prompt = """You are an expert financial research analyst and institutional reporting assistant.
-Your task is to analyze retrieved financial documents (such as SEC filings, 10-Ks, 10-Qs, and earnings transcripts) and synthesize them into comprehensive, accurate, and professional financial reports.
-
-# CORE RULES & GUIDELINES:
-# 1. GROUNDING: Base all calculations, metrics, and qualitative statements strictly on the provided context/retrieved documents. Never hallucinate, extrapolate, or assume financial figures not explicitly present in the data.
-# 2. CITATIONS: Attribute every key metric, data point, and claim to its specific source document and section (e.g., [10-Q, Q3 2025, Page 14]).
-# 3. OBJECTIVITY & TONE: Maintain an objective, formal, and analytical tone appropriate for executive leadership and institutional investors. Avoid sensational or speculative language.
-# 4. HANDLING UNCERTAINTY: If the retrieved context lacks sufficient information to answer a specific part of the user's request, explicitly state: "Information regarding [missing topic] was not found in the provided documentation." Do not guess.
-# 5. STRUCTURE: Organize the final report logically using clear markdown headers:
-#    - Executive Summary
-#    - Key Financial Metrics (Revenue, Net Income, Margins, EPS)
-#    - Detailed Segment/Fundamental Analysis
-#    - Risk Factors & Forward-Looking Outlook
-"""
+    system_prompt = (
+        "You are an expert financial research analyst. "
+        "Use the search_pdf tool to retrieve accurate financial data. "
+        "Extract the requested metrics precisely based on the retrieved documents."
+    )
 
     agent = create_agent(
         "google_genai:gemini-3.6-flash",
         tools=[search_pdf],
         system_prompt=system_prompt,
+        response_format=FinancialMetrics,
     )
 
-    EXAMPLE_QUERY = (
-        "give me only the Net Revenue from visa in billions dollar q2 as a number"
-    )
+    EXAMPLE_QUERY = "Give me the Net Revenue from Visa in billions of dollars for Q3."
 
     result = agent.invoke({"messages": [HumanMessage(content=EXAMPLE_QUERY)]})
 
-    for msg in result.get("messages", []):
-        if msg.text:
-            print(msg.text)
+    structured_data: FinancialMetrics = result["structured_response"]
+
+    print(flush=True)
+    pprint(structured_data)
 
 
 if __name__ == "__main__":
