@@ -1,4 +1,5 @@
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from pprint import pprint
@@ -8,16 +9,24 @@ from langchain.agents import create_agent
 from langchain.messages import HumanMessage
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.tools import tool
-from langchain_community.vectorstores import InMemoryVectorStore
 from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_postgres import PGVector
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel, Field
 
 load_dotenv()
 
-embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-vector_store = InMemoryVectorStore(embeddings)
+PSQL_URL = os.getenv("PSQL_URL")
+if not PSQL_URL:
+    sys.exit("Error: PSQL_URL is missing or empty in .env")
+
+embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-m3")
+vector_store = PGVector(
+    embeddings=embeddings,
+    collection_name="financial_reports",
+    connection=PSQL_URL,
+)
 
 
 class FinancialMetrics(BaseModel):
@@ -43,7 +52,7 @@ def _process_single_pdf(file_path: Path) -> list[Document]:
         return []
 
 
-def split_pdf_content(files: list[Path], max_workers: int = 3) -> list[Document]:
+def split_pdf_content(files: list[Path], max_workers: int) -> list[Document]:
     all_documents: list[Document] = []
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -65,7 +74,7 @@ def load_embeddings(documents: list[Document]):
 
 @tool
 def search_pdf(query: str) -> str:
-    """Search in visa financial report in query
+    """Search in vectore store about financial report from query
 
     Args:
         query (str): search query in document
@@ -74,7 +83,7 @@ def search_pdf(query: str) -> str:
         str: information about the data in the document
     """
 
-    retriev = vector_store.similarity_search(query=query)
+    retriev: list[Document] = vector_store.similarity_search(query=query)
     return "\n\n".join([document.page_content for document in retriev])
 
 
@@ -84,12 +93,12 @@ def main():
 
     pdf_files: list[Path] = [file for file in dir.glob("*.pdf") if file.is_file()]
 
-    documents: list[Document] = split_pdf_content(pdf_files, max_workers=max_workers)
+    documents: list[Document] = split_pdf_content(pdf_files, max_workers)
     load_embeddings(documents)
 
     system_prompt = (
-        "You are an expert financial research analyst. "
-        "Use the search_pdf tool to retrieve accurate financial data. "
+        "You are an expert financial research analyst."
+        "Use the search_pdf tool to retrieve accurate financial data."
         "Extract the requested metrics precisely based on the retrieved documents."
     )
 
@@ -100,7 +109,7 @@ def main():
         response_format=FinancialMetrics,
     )
 
-    EXAMPLE_QUERY = "Give me the Net Revenue from Visa in billions of dollars for Q3."
+    EXAMPLE_QUERY = "Give me the Net Revenue from Visa in billions of dollars for Q1."
 
     result = agent.invoke({"messages": [HumanMessage(content=EXAMPLE_QUERY)]})
 
